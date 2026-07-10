@@ -1,0 +1,13 @@
+*.session
+*.session-journal
+seen_xchina_video.json
+next_video_page.txt
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

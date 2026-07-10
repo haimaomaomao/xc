@@ -11,4 +11,7 @@ COPY xchina_downloader.py .
 
 ENV PYTHONUNBUFFERED=1
 
-# 持久化数据目录 — Railway 部署时
+# Persistent data directory -- mount a Railway volume at this path
+VOLUME ["/data"]
+
+CMD ["python", "-u", "xchina_downloader.py"]
