@@ -1,0 +1,583 @@
+#!/usr/bin/env python3
+"""
+xchina.co video downloader -> Telegram channel
+Railway deployment: self-looping, fetches one page every 6 hours
+State files persisted in /data (Railway volume)
+"""
+
+import requests
+from bs4 import BeautifulSoup
+import os, re, time, json, sys, subprocess, tempfile, asyncio, base64, gzip, logging
+from telethon import TelegramClient
+import urllib3
+from PIL import Image
+import io
+
+urllib3.disable_warnings()
+
+# ==================== Logging ====================
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
+)
+logger = logging.getLogger("xchina")
+
+# Raise Pillow decompression bomb limit to avoid rejecting large cover images
+Image.MAX_IMAGE_PIXELS = int(os.getenv("MAX_IMAGE_PIXELS", "200000000"))
+
+# ==================== Config ====================
+CF_COOKIE       = os.getenv("CF_COOKIE", "")
+BASE_URL        = "https://xchina.co"
+SERIES_URL      = "https://xchina.co/videos/series-63824a975d8ae/{page}.html"
+FIRST_URL       = "https://xchina.co/videos/series-63824a975d8ae.html"
+DATA_DIR        = os.getenv("DATA_DIR", "/data")
+SEEN_FILE       = os.path.join(DATA_DIR, "seen_xchina_video.json")
+PAGE_FILE       = os.path.join(DATA_DIR, "next_video_page.txt")
+SESSION_FILE    = os.path.join(DATA_DIR, "xchina_video.session")
+START_PAGE      = 1
+FETCH_PAGES     = 1
+TG_INTERVAL     = int(os.getenv("TG_INTERVAL", "10"))
+LOOP_INTERVAL   = int(os.getenv("LOOP_INTERVAL", "21600"))
+FFMPEG_TIMEOUT  = int(os.getenv("FFMPEG_TIMEOUT", "300"))
+
+API_ID          = int(os.getenv("TG_API_ID", "0"))
+API_HASH        = os.getenv("TG_API_HASH", "")
+PHONE           = os.getenv("TG_PHONE", "")
+CHAT_ID         = int(os.getenv("TG_CHAT_ID", "0"))
+TG_SESSION_B64  = os.getenv("TG_SESSION", "")
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
+
+# SSL verification: enabled by default; set VERIFY_SSL=0 to disable
+if os.getenv("VERIFY_SSL", "1") == "0":
+    logger.warning("SSL verification disabled")
+    SESSION.verify = False
+else:
+    SESSION.verify = True
+
+def inject_cookies(cookie_str):
+    if not cookie_str:
+        logger.warning("CF_COOKIE not set")
+        return
+    for part in cookie_str.split(";"):
+        part = part.strip()
+        if "=" in part:
+            k, v = part.split("=", 1)
+            SESSION.cookies.set(k.strip(), v.strip(), domain="xchina.co")
+    logger.info("Cookies injected")
+
+inject_cookies(CF_COOKIE)
+
+# ==================== State files ====================
+
+def load_page():
+    if not os.path.exists(PAGE_FILE):
+        return START_PAGE
+    try:
+        return max(int(open(PAGE_FILE).read().strip()), 1)
+    except:
+        return START_PAGE
+
+def save_page(page):
+    with open(PAGE_FILE, "w") as f:
+        f.write(str(page))
+
+def load_seen():
+    if not os.path.exists(SEEN_FILE):
+        return set()
+    try:
+        return set(json.load(open(SEEN_FILE, encoding="utf-8")))
+    except:
+        return set()
+
+def save_seen(seen):
+    with open(SEEN_FILE, "w", encoding="utf-8") as f:
+        json.dump(list(seen), f, ensure_ascii=False)
+
+# ==================== Session ====================
+
+def restore_session():
+    if not TG_SESSION_B64:
+        return
+    try:
+        raw = base64.b64decode(TG_SESSION_B64)
+        # Try gzip decompression (gzip magic: 1f 8b)
+        if raw[:2] == b'\x1f\x8b':
+            raw = gzip.decompress(raw)
+            logger.info("TG_SESSION decompressed from gzip")
+        with open(SESSION_FILE, "wb") as f:
+            f.write(raw)
+        logger.info("Session restored from TG_SESSION")
+    except Exception as e:
+        logger.warning(f"Session restore failed: {e}")
+
+# ==================== HTTP requests ====================
+
+def safe_get(url, retries=2, timeout=15):
+    for i in range(retries):
+        try:
+            logger.debug(f"  GET {url[:60]}...")
+            sys.stdout.flush()
+            r = SESSION.get(url, timeout=timeout)
+            logger.debug(f"  status={r.status_code}, size={len(r.text)}")
+            sys.stdout.flush()
+            if r.status_code == 200:
+                # Cloudflare challenge detection
+                if len(r.text) < 5000 and "cloudflare" in r.text.lower():
+                    logger.warning(f"  Cloudflare challenge detected ({len(r.text)} bytes)")
+                    return None
+                return r
+            elif r.status_code == 403:
+                logger.warning(f"  403: {url}")
+                return None
+            elif r.status_code == 429:
+                wait = int(r.headers.get("Retry-After", 30))
+                logger.warning(f"  Rate limited, waiting {wait}s")
+                time.sleep(wait)
+            else:
+                logger.warning(f"  HTTP {r.status_code}")
+                time.sleep(2)
+        except requests.exceptions.ConnectTimeout as e:
+            logger.warning(f"  Connect timeout ({i+1}/{retries}): {url[:40]}...")
+            sys.stdout.flush()
+            time.sleep(2)
+        except requests.exceptions.ReadTimeout as e:
+            logger.warning(f"  Read timeout ({i+1}/{retries}): {url[:40]}...")
+            sys.stdout.flush()
+            time.sleep(2)
+        except Exception as e:
+            logger.warning(f"  Request error ({i+1}/{retries}): {type(e).__name__}: {e}")
+            sys.stdout.flush()
+            time.sleep(2)
+    return None
+
+def fix_url(url):
+    if not url:
+        return None
+    url = url.strip()
+    if url.startswith("//"):
+        return "https:" + url
+    if url.startswith("/"):
+        return BASE_URL + url
+    if not url.startswith("http"):
+        return BASE_URL + "/" + url
+    return url
+
+def get_page_url(page):
+    return FIRST_URL if page == 1 else SERIES_URL.format(page=page)
+
+# ==================== Video list parsing ====================
+
+def get_videos_from_list(page):
+    url = get_page_url(page)
+    logger.info(f"Listing page {page}: {url}")
+    sys.stdout.flush()
+    r = safe_get(url)
+    if not r:
+        raise RuntimeError(f"Cloudflare challenge or request failed (page {page}), please update CF_COOKIE")
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    has_video_list = bool(soup.select_one("div.list.video-list"))
+    items = soup.select("div.item.video")
+    logger.info(f"  has_video_list={has_video_list}, item_count={len(items)}")
+    sys.stdout.flush()
+    videos = []
+    seen_ids = set()
+
+    for item in soup.select("div.list.video-list div.item.video"):
+        a_tag = item.find("a", href=re.compile(r'/video/id-[a-f0-9]+\.html'))
+        if not a_tag:
+            continue
+        detail_url = a_tag["href"]
+        if not detail_url.startswith("http"):
+            detail_url = BASE_URL + detail_url
+        m = re.search(r'/video/id-([a-f0-9]+)\.html', detail_url)
+        if not m:
+            continue
+        vid_id = m.group(1)
+        if vid_id in seen_ids:
+            continue
+        seen_ids.add(vid_id)
+
+        cover = ""
+        img_div = item.select_one("div.img[style]")
+        if img_div:
+            mc = re.search(r"url\(['\"]?(https?://[^'\")\s]+)['\"]?\)", img_div.get("style",""))
+            if mc:
+                cover = mc.group(1)
+
+        actor = ""
+        model_div = item.select_one(".model-container")
+        if model_div:
+            actor = model_div.get_text(strip=True)
+
+        title_from_list = a_tag.get("title", "") or a_tag.get_text(strip=True)
+
+        platform = ""
+        tags_div = item.select_one("div.tags")
+        if tags_div:
+            for d in tags_div.find_all("div", recursive=False):
+                if not d.get("class") and not d.find("i"):
+                    t = d.get_text(strip=True)
+                    if t:
+                        platform = t
+                        break
+
+        videos.append({
+            "vid_id": vid_id,
+            "url": detail_url,
+            "cover": cover,
+            "actor": actor,
+            "platform": platform,
+            "title": title_from_list,
+        })
+
+    logger.info(f"  Found {len(videos)} videos")
+    return videos
+
+# ==================== Detail page parsing ====================
+
+def get_m3u8_url(video_url):
+    r = safe_get(video_url)
+    if not r:
+        return None
+    # Primary: match video.xchina.download domain m3u8
+    m = re.search(
+        r"src:\s*['\"]"
+        r"(https://video\.xchina\.download/m3u8/[^'\"]+\.m3u8[^'\"]*)"
+        r"['\"]",
+        r.text
+    )
+    if m:
+        return m.group(1)
+    # Fallback: only match xchina-related domain m3u8 links
+    m2 = re.search(r"(https://[^\s'\"<>]*xchina[^\s'\"<>]*\.m3u8[^\s'\"<>]*)", r.text)
+    return m2.group(1) if m2 else None
+
+def get_preview_image_url(video_url):
+    r = safe_get(video_url)
+    if not r:
+        return None
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    container = soup.select_one("div.screenshot-container")
+    if container:
+        imgs = container.find_all("img")
+        if imgs:
+            src = imgs[0].get("src") or imgs[0].get("data-src")
+            if src:
+                return fix_url(src)
+
+    og = soup.find("meta", property="og:image")
+    if og and og.get("content"):
+        return fix_url(og["content"])
+
+    tw = soup.find("meta", attrs={"name": "twitter:image"})
+    if tw and tw.get("content"):
+        return fix_url(tw["content"])
+
+    return None
+
+# ==================== Image & video processing ====================
+
+def download_and_convert_thumbnail(url, referer, max_size_kb=200, max_dim=640):
+    try:
+        logger.info(f"  Downloading preview: {url[:80]}...")
+        r = SESSION.get(url, headers={"Referer": referer}, timeout=30)
+        r.raise_for_status()
+        if len(r.content) < 2000:
+            logger.warning("  Image too small, may be invalid")
+            return None
+
+        img = Image.open(io.BytesIO(r.content))
+        if img.mode in ('RGBA', 'LA', 'P'):
+            bg = Image.new('RGB', img.size, (255, 255, 255))
+            if img.mode == 'P':
+                img = img.convert('RGBA')
+            bg.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+            img = bg
+        elif img.mode != 'RGB':
+            img = img.convert('RGB')
+
+        # Use new Resampling.LANCZOS, with fallback to old LANCZOS and BICUBIC
+        resample_filter = getattr(Image.Resampling, 'LANCZOS', getattr(Image, 'LANCZOS', Image.BICUBIC))
+        img.thumbnail((max_dim, max_dim), resample_filter)
+
+        thumb_io = io.BytesIO()
+        quality = 85
+        while quality >= 30:
+            thumb_io.seek(0)
+            thumb_io.truncate()
+            img.save(thumb_io, format='JPEG', quality=quality, optimize=True)
+            if thumb_io.tell() <= max_size_kb * 1024:
+                break
+            quality -= 10
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
+        tmp.write(thumb_io.getvalue())
+        tmp.close()
+        logger.info(f"  Thumbnail ready: {os.path.getsize(tmp.name)//1024}KB")
+        return tmp.name
+    except Image.DecompressionBombError:
+        logger.error("  Image too large (decompression bomb limit), skipped")
+        return None
+    except Exception as e:
+        logger.error(f"  Thumbnail processing failed: {e}")
+        return None
+
+def download_m3u8_to_mp4(m3u8_url, referer):
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    tmp.close()
+    out_path = tmp.name
+
+    # Write headers to temp file to avoid leaking Cookie in process command line
+    headers_file = tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="w")
+    headers_file.write(f"Referer: {referer}\r\n")
+    headers_file.write("User-Agent: Mozilla/5.0\r\n")
+    if CF_COOKIE:
+        headers_file.write(f"Cookie: {CF_COOKIE}\r\n")
+    headers_file.close()
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-headers", f"@{headers_file.name}",
+        "-i", m3u8_url,
+        "-c", "copy",
+        "-movflags", "+faststart",
+        out_path
+    ]
+    logger.info(f"  ffmpeg downloading... (max {FFMPEG_TIMEOUT}s)")
+    sys.stdout.flush()
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=False,
+            timeout=FFMPEG_TIMEOUT,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        # Clean up headers file
+        try:
+            os.unlink(headers_file.name)
+        except:
+            pass
+
+        if result.returncode != 0:
+            logger.warning("  ffmpeg failed")
+            try:
+                os.unlink(out_path)
+            except:
+                pass
+            return None
+
+        size_mb = os.path.getsize(out_path) / 1024 / 1024
+        logger.info(f"  Video downloaded: {size_mb:.1f}MB")
+        return out_path
+    except subprocess.TimeoutExpired:
+        logger.warning(f"  ffmpeg timeout ({FFMPEG_TIMEOUT}s)")
+        try:
+            os.unlink(out_path)
+        except:
+            pass
+        try:
+            os.unlink(headers_file.name)
+        except:
+            pass
+        return None
+    except Exception as e:
+        logger.error(f"  ffmpeg error: {e}")
+        try:
+            os.unlink(out_path)
+        except:
+            pass
+        try:
+            os.unlink(headers_file.name)
+        except:
+            pass
+        return None
+
+# ==================== Telegram sending ====================
+
+def build_caption(info):
+    title = info.get("title", "Unknown")
+    platform = info.get("platform", "")
+    actor = info.get("actor", "")
+    lines = [f"Title: {title}"]
+    if platform:
+        lines.append(f"Platform: #{platform}")
+    if actor:
+        lines.append(f"Actor: #{actor}")
+    return "\n".join(lines)
+
+async def send_video_with_thumb(client, video_path, thumb_path, caption):
+    try:
+        logger.info("  Sending video to channel...")
+        await client.send_file(
+            CHAT_ID,
+            video_path,
+            caption=caption,
+            thumb=thumb_path,
+            supports_streaming=True,
+            force_document=False
+        )
+        logger.info("  Video sent successfully")
+        return True
+    except Exception as e:
+        logger.error(f"  Send failed: {e}")
+        return False
+
+# ==================== Single run ====================
+
+async def run_once():
+    seen = load_seen()
+    current_page = load_page()
+    logger.info(f"Starting from page {current_page}, fetching {FETCH_PAGES} page(s)")
+
+    pages = list(range(current_page, current_page + FETCH_PAGES))
+    all_videos = []
+    for page in pages:
+        try:
+            vids = get_videos_from_list(page)
+        except RuntimeError as e:
+            logger.error(f"{e}")
+            logger.info("State saved, will retry this page next run")
+            return False
+        # Reverse so newest videos (from higher-numbered pages) are processed first
+        vids.reverse()
+        all_videos.extend(vids)
+        time.sleep(1)
+
+    seen_run = set()
+    unique = []
+    for v in all_videos:
+        if v["vid_id"] not in seen and v["vid_id"] not in seen_run:
+            unique.append(v)
+            seen_run.add(v["vid_id"])
+
+    logger.info(f"New videos: {len(unique)}")
+    if not unique:
+        logger.info("No new videos, advancing to next page")
+        save_page(current_page + FETCH_PAGES)
+        return True
+
+    logger.info("  Connecting to Telegram...")
+    sys.stdout.flush()
+    client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
+    try:
+        # When session is valid, phone is not needed; pass None instead of empty string
+        phone_to_use = PHONE if PHONE else None
+        await asyncio.wait_for(client.start(phone=phone_to_use), timeout=30)
+        logger.info("Telegram client logged in")
+    except asyncio.TimeoutError:
+        logger.warning("Telegram login timeout (30s), skipping this round")
+        await client.disconnect()
+        return True
+    except Exception as e:
+        logger.error(f"Telegram login failed: {e}")
+        await client.disconnect()
+        return True
+    sys.stdout.flush()
+
+    try:
+        for idx, video in enumerate(unique):
+            logger.info(f"[{idx+1}/{len(unique)}] {video['url']}")
+
+            m3u8 = get_m3u8_url(video["url"])
+            if not m3u8:
+                logger.warning("  No m3u8 found, skipping")
+                seen.add(video["vid_id"])
+                save_seen(seen)
+                continue
+            video_path = download_m3u8_to_mp4(m3u8, video["url"])
+            if not video_path:
+                seen.add(video["vid_id"])
+                save_seen(seen)
+                continue
+
+            thumb_path = None
+            img_url = get_preview_image_url(video["url"])
+            if not img_url and video.get("cover"):
+                img_url = video["cover"]
+                logger.info(f"  Using list page cover: {img_url}")
+            if img_url:
+                thumb_path = download_and_convert_thumbnail(img_url, video["url"])
+            else:
+                logger.warning("  No preview image found, sending without thumbnail")
+
+            caption = build_caption(video)
+            ok = await send_video_with_thumb(client, video_path, thumb_path, caption)
+
+            for p in [video_path, thumb_path]:
+                if p and os.path.exists(p):
+                    os.unlink(p)
+            if ok:
+                seen.add(video["vid_id"])
+                save_seen(seen)
+            await asyncio.sleep(TG_INTERVAL)
+    finally:
+        await client.disconnect()
+
+    save_page(current_page + FETCH_PAGES)
+    logger.info(f"Done, next run starts from page {current_page + FETCH_PAGES}")
+    return True
+
+# ==================== Entrypoint ====================
+
+def main():
+    if not CF_COOKIE:
+        logger.error("CF_COOKIE not set")
+        sys.exit(1)
+    if not API_ID or not API_HASH or not CHAT_ID:
+        logger.error("Missing Telegram config")
+        sys.exit(1)
+    if not PHONE and not TG_SESSION_B64:
+        logger.error("TG_PHONE or TG_SESSION is required")
+        sys.exit(1)
+
+    os.makedirs(DATA_DIR, exist_ok=True)
+    restore_session()
+
+    if not os.path.exists(PAGE_FILE):
+        with open(PAGE_FILE, "w") as f:
+            f.write(str(START_PAGE))
+        logger.info(f"{PAGE_FILE} initialized to {START_PAGE}")
+    if not os.path.exists(SEEN_FILE):
+        with open(SEEN_FILE, "w") as f:
+            json.dump([], f)
+        logger.info(f"{SEEN_FILE} initialized to empty")
+
+    while True:
+        logger.info("=" * 50)
+        logger.info(f"{time.strftime('%Y-%m-%d %H:%M:%S')} -- Starting new run")
+        logger.info("=" * 50)
+        try:
+            ok = asyncio.run(run_once(), debug=False)
+        except Exception as e:
+            logger.error(f"Run exception: {e}", exc_info=True)
+            ok = False
+
+        if ok:
+            next_run = time.strftime('%Y-%m-%d %H:%M:%S',
+                                     time.localtime(time.time() + LOOP_INTERVAL))
+            logger.info(f"Waiting {LOOP_INTERVAL}s, next run: {next_run}")
+        else:
+            backoff = min(LOOP_INTERVAL // 2, 1800)
+            retry_time = time.strftime('%Y-%m-%d %H:%M:%S',
+                                       time.localtime(time.time() + backoff))
+            logger.info(f"Run not fully successful, retrying in {backoff}s ({retry_time})")
+            time.sleep(backoff)
+            continue
+
+        time.sleep(LOOP_INTERVAL)
+
+if __name__ == "__main__":
+    main()
