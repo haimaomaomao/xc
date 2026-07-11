@@ -126,12 +126,15 @@ def restore_session():
         if raw[:2] == b'\x1f\x8b':
             raw = gzip.decompress(raw)
             logger.info("TG_SESSION decompressed from gzip")
+        # Delete old session file (and journal) to avoid SQLite lock issues
+        for f in [SESSION_FILE, SESSION_FILE + "-journal", SESSION_FILE + "-wal", SESSION_FILE + "-shm"]:
+            if os.path.exists(f):
+                try:
+                    os.unlink(f)
+                    logger.debug(f"Deleted old session file: {f}")
+                except:
+                    pass
         # Only write if content changed (avoid unnecessary disk I/O)
-        if os.path.exists(SESSION_FILE):
-            with open(SESSION_FILE, "rb") as f:
-                existing = f.read()
-            if existing == raw:
-                return True
         with open(SESSION_FILE, "wb") as f:
             f.write(raw)
         logger.info("Session restored from TG_SESSION")
