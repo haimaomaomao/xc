@@ -187,7 +187,7 @@ def safe_get(url, retries=2, timeout=15):
                     logger.warning(f"  After 429 wait: HTTP {r2.status_code}")
                 except Exception as e2:
                     logger.warning(f"  After 429 wait: {type(e2).__name__}: {e2}")
-                continue
+                return None
             else:
                 logger.warning(f"  HTTP {r.status_code}")
                 time.sleep(2)
@@ -384,6 +384,7 @@ def download_m3u8_to_mp4(m3u8_url, referer):
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     tmp.close()
     out_path = tmp.name
+    tmp_dir = None
     tmp_dir = tempfile.mkdtemp(prefix="m3u8_")
 
     try:
@@ -567,6 +568,12 @@ async def run_once():
         return False
     except Exception as e:
         logger.error(f"Telegram login failed: {e}, will retry with backoff")
+        # Delete session file so it can be re-restored from env var next run
+        for sf in [SESSION_FILE, SESSION_FILE + "-journal", SESSION_FILE + "-wal", SESSION_FILE + "-shm"]:
+            try:
+                os.unlink(sf)
+            except:
+                pass
         await client.disconnect()
         return False
     sys.stdout.flush()
@@ -634,7 +641,6 @@ def main():
         sys.exit(1)
 
     os.makedirs(DATA_DIR, exist_ok=True)
-    restore_session()
 
     if not os.path.exists(PAGE_FILE):
         with open(PAGE_FILE, "w") as f:
