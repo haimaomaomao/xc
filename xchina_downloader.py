@@ -382,21 +382,26 @@ def download_m3u8_to_mp4(m3u8_url, referer):
     tmp.close()
     out_path = tmp.name
 
-    # yt-dlp with concurrent fragment download (much faster than ffmpeg single-thread)
+    # yt-dlp with aria2c/ffmpeg downloader for m3u8
     cmd = [
         "yt-dlp",
-        "--concurrent-fragments", "8",
+        "--downloader", "ffmpeg",
+        "--hls-use-mpegts",
         "--no-check-certificates",
         "--no-warnings",
+        "--socket-timeout", "30",
+        "--retries", "5",
+        "--fragment-retries", "5",
         "-o", out_path,
     ]
     # Add headers
     if CF_COOKIE:
         cmd.extend(["--add-header", f"Cookie: {CF_COOKIE}"])
     cmd.extend(["--add-header", f"Referer: {referer}"])
+    cmd.extend(["--add-header", f"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)"])
     cmd.append(m3u8_url)
 
-    logger.info(f"  yt-dlp downloading... (max {FFMPEG_TIMEOUT}s, 8 concurrent)")
+    logger.info(f"  yt-dlp downloading... (max {FFMPEG_TIMEOUT}s, ffmpeg backend)")
     sys.stdout.flush()
     try:
         result = subprocess.run(
