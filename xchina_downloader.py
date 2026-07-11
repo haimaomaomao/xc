@@ -443,7 +443,6 @@ def download_m3u8_to_mp4(m3u8_url, referer):
             for _, fname in seg_files:
                 with open(fname, "rb") as inf:
                     outf.write(inf.read())
-            return None
 
         size_mb = os.path.getsize(out_path) / 1024 / 1024
         logger.info(f"  Video downloaded: {size_mb:.1f}MB ({len(seg_files)} segments)")
