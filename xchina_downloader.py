@@ -399,6 +399,12 @@ def download_m3u8_to_mp4(m3u8_url, referer):
         out_path
     ]
     logger.info(f"  ffmpeg downloading... (max {FFMPEG_TIMEOUT}s)")
+    # Debug: check m3u8 URL first
+    try:
+        test_r = SESSION.get(m3u8_url, headers={"Referer": referer}, timeout=10)
+        logger.debug(f"  m3u8 status={test_r.status_code} size={len(test_r.text)} first100={test_r.text[:100].strip()}")
+    except:
+        pass
     sys.stdout.flush()
     try:
         result = subprocess.run(
