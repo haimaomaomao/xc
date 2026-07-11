@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 xchina.co video downloader -> Telegram channel
 Railway deployment: self-looping, fetches one page every 6 hours
@@ -42,6 +42,7 @@ FETCH_PAGES     = 1
 TG_INTERVAL     = int(os.getenv("TG_INTERVAL", "10"))
 LOOP_INTERVAL   = int(os.getenv("LOOP_INTERVAL", "21600"))
 FFMPEG_TIMEOUT  = int(os.getenv("FFMPEG_TIMEOUT", "300"))
+MAX_SEEN_ENTRIES = int(os.getenv("MAX_SEEN_ENTRIES", "50000"))
 
 API_ID          = int(os.getenv("TG_API_ID", "0"))
 API_HASH        = os.getenv("TG_API_HASH", "")
@@ -95,30 +96,49 @@ def load_seen():
     if not os.path.exists(SEEN_FILE):
         return set()
     try:
-        return set(json.load(open(SEEN_FILE, encoding="utf-8")))
+        data = json.load(open(SEEN_FILE, encoding="utf-8"))
+        seen = set(data)
+        # Trim to max entries if exceeded
+        if len(seen) > MAX_SEEN_ENTRIES:
+            logger.warning(f"seen set has {len(seen)} entries, trimming to {MAX_SEEN_ENTRIES}")
+            seen = set(list(seen)[-MAX_SEEN_ENTRIES:])
+        return seen
     except:
         return set()
 
 def save_seen(seen):
+    # Enforce maximum size before saving
+    if len(seen) > MAX_SEEN_ENTRIES:
+        logger.warning(f"Trimming seen set from {len(seen)} to {MAX_SEEN_ENTRIES}")
+        seen = set(list(seen)[-MAX_SEEN_ENTRIES:])
     with open(SEEN_FILE, "w", encoding="utf-8") as f:
         json.dump(list(seen), f, ensure_ascii=False)
 
 # ==================== Session ====================
 
 def restore_session():
+    """Restore Telegram session from TG_SESSION env var. Returns True if restored."""
     if not TG_SESSION_B64:
-        return
+        return False
     try:
         raw = base64.b64decode(TG_SESSION_B64)
         # Try gzip decompression (gzip magic: 1f 8b)
         if raw[:2] == b'\x1f\x8b':
             raw = gzip.decompress(raw)
             logger.info("TG_SESSION decompressed from gzip")
+        # Only write if content changed (avoid unnecessary disk I/O)
+        if os.path.exists(SESSION_FILE):
+            with open(SESSION_FILE, "rb") as f:
+                existing = f.read()
+            if existing == raw:
+                return True
         with open(SESSION_FILE, "wb") as f:
             f.write(raw)
         logger.info("Session restored from TG_SESSION")
+        return True
     except Exception as e:
         logger.warning(f"Session restore failed: {e}")
+        return False
 
 # ==================== HTTP requests ====================
 
@@ -131,8 +151,12 @@ def safe_get(url, retries=2, timeout=15):
             logger.debug(f"  status={r.status_code}, size={len(r.text)}")
             sys.stdout.flush()
             if r.status_code == 200:
-                # Cloudflare challenge detection
-                if len(r.text) < 5000 and "cloudflare" in r.text.lower():
+                # Cloudflare challenge detection: check for common indicators
+                text_lower = r.text.lower()
+                is_cf = ("cloudflare" in text_lower or
+                         "cf-" in text_lower or
+                         "challenge-platform" in text_lower)
+                if len(r.text) < 20000 and is_cf:
                     logger.warning(f"  Cloudflare challenge detected ({len(r.text)} bytes)")
                     return None
                 return r
@@ -141,8 +165,25 @@ def safe_get(url, retries=2, timeout=15):
                 return None
             elif r.status_code == 429:
                 wait = int(r.headers.get("Retry-After", 30))
-                logger.warning(f"  Rate limited, waiting {wait}s")
+                logger.warning(f"  Rate limited (429), waiting {wait}s before retry")
                 time.sleep(wait)
+                # Retry immediately after waiting; do not count as a consumed attempt
+                try:
+                    logger.debug(f"  Retrying GET after 429 {url[:60]}...")
+                    r2 = SESSION.get(url, timeout=timeout)
+                    if r2.status_code == 200:
+                        text_lower2 = r2.text.lower()
+                        is_cf2 = ("cloudflare" in text_lower2 or
+                                  "cf-" in text_lower2 or
+                                  "challenge-platform" in text_lower2)
+                        if len(r2.text) < 20000 and is_cf2:
+                            logger.warning(f"  Cloudflare challenge after 429 wait")
+                            return None
+                        return r2
+                    logger.warning(f"  After 429 wait: HTTP {r2.status_code}")
+                except Exception as e2:
+                    logger.warning(f"  After 429 wait: {type(e2).__name__}: {e2}")
+                continue
             else:
                 logger.warning(f"  HTTP {r.status_code}")
                 time.sleep(2)
@@ -211,7 +252,7 @@ def get_videos_from_list(page):
         cover = ""
         img_div = item.select_one("div.img[style]")
         if img_div:
-            mc = re.search(r"url\(['\"]?(https?://[^'\")\s]+)['\"]?\)", img_div.get("style",""))
+            mc = re.search(r"url\(['\"]?(https?://[^'\"\s]+)['\"]?\)", img_div.get("style",""))
             if mc:
                 cover = mc.group(1)
 
@@ -435,9 +476,25 @@ async def send_video_with_thumb(client, video_path, thumb_path, caption):
         logger.error(f"  Send failed: {e}")
         return False
 
+# ==================== Session restore helper ====================
+
+_session_restored_at_least_once = False
+
+def ensure_session():
+    """Restore session if TG_SESSION env var is set and session file missing/stale."""
+    global _session_restored_at_least_once
+    if not TG_SESSION_B64:
+        return
+    # Always try to restore on first call; afterwards only if session file is missing
+    if not _session_restored_at_least_once or not os.path.exists(SESSION_FILE):
+        if restore_session():
+            _session_restored_at_least_once = True
+
 # ==================== Single run ====================
 
 async def run_once():
+    ensure_session()
+
     seen = load_seen()
     current_page = load_page()
     logger.info(f"Starting from page {current_page}, fetching {FETCH_PAGES} page(s)")
@@ -478,29 +535,29 @@ async def run_once():
         await asyncio.wait_for(client.start(phone=phone_to_use), timeout=30)
         logger.info("Telegram client logged in")
     except asyncio.TimeoutError:
-        logger.warning("Telegram login timeout (30s), skipping this round")
+        logger.warning("Telegram login timeout (30s), will retry with backoff")
         await client.disconnect()
-        return True
+        return False
     except Exception as e:
-        logger.error(f"Telegram login failed: {e}")
+        logger.error(f"Telegram login failed: {e}, will retry with backoff")
         await client.disconnect()
-        return True
+        return False
     sys.stdout.flush()
 
     try:
+        failed_videos = []
         for idx, video in enumerate(unique):
             logger.info(f"[{idx+1}/{len(unique)}] {video['url']}")
 
             m3u8 = get_m3u8_url(video["url"])
             if not m3u8:
-                logger.warning("  No m3u8 found, skipping")
-                seen.add(video["vid_id"])
-                save_seen(seen)
+                logger.warning("  No m3u8 found, will retry next run")
+                failed_videos.append(video["vid_id"])
                 continue
             video_path = download_m3u8_to_mp4(m3u8, video["url"])
             if not video_path:
-                seen.add(video["vid_id"])
-                save_seen(seen)
+                logger.warning("  Download failed, will retry next run")
+                failed_videos.append(video["vid_id"])
                 continue
 
             thumb_path = None
@@ -522,7 +579,13 @@ async def run_once():
             if ok:
                 seen.add(video["vid_id"])
                 save_seen(seen)
+            else:
+                logger.warning("  Send failed, will retry next run")
+                failed_videos.append(video["vid_id"])
             await asyncio.sleep(TG_INTERVAL)
+
+        if failed_videos:
+            logger.warning(f"  {len(failed_videos)} video(s) failed, will retry next run")
     finally:
         await client.disconnect()
 
