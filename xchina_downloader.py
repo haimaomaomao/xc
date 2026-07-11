@@ -382,23 +382,21 @@ def download_m3u8_to_mp4(m3u8_url, referer):
     tmp.close()
     out_path = tmp.name
 
-    # Write headers to temp file to avoid leaking Cookie in process command line
-    headers_file = tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="w")
-    headers_file.write(f"Referer: {referer}\r\n")
-    headers_file.write("User-Agent: Mozilla/5.0\r\n")
-    if CF_COOKIE:
-        headers_file.write(f"Cookie: {CF_COOKIE}\r\n")
-    headers_file.close()
-
+    # yt-dlp with concurrent fragment download (much faster than ffmpeg single-thread)
     cmd = [
-        "ffmpeg", "-y",
-        "-headers", f"@{headers_file.name}",
-        "-i", m3u8_url,
-        "-c", "copy",
-        "-movflags", "+faststart",
-        out_path
+        "yt-dlp",
+        "--concurrent-fragments", "8",
+        "--no-check-certificates",
+        "--no-warnings",
+        "-o", out_path,
     ]
-    logger.info(f"  ffmpeg downloading... (max {FFMPEG_TIMEOUT}s)")
+    # Add headers
+    if CF_COOKIE:
+        cmd.extend(["--add-header", f"Cookie: {CF_COOKIE}"])
+    cmd.extend(["--add-header", f"Referer: {referer}"])
+    cmd.append(m3u8_url)
+
+    logger.info(f"  yt-dlp downloading... (max {FFMPEG_TIMEOUT}s, 8 concurrent)")
     sys.stdout.flush()
     try:
         result = subprocess.run(
@@ -409,14 +407,8 @@ def download_m3u8_to_mp4(m3u8_url, referer):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        # Clean up headers file
-        try:
-            os.unlink(headers_file.name)
-        except:
-            pass
-
         if result.returncode != 0:
-            logger.warning("  ffmpeg failed")
+            logger.warning("  yt-dlp failed")
             try:
                 os.unlink(out_path)
             except:
@@ -427,24 +419,16 @@ def download_m3u8_to_mp4(m3u8_url, referer):
         logger.info(f"  Video downloaded: {size_mb:.1f}MB")
         return out_path
     except subprocess.TimeoutExpired:
-        logger.warning(f"  ffmpeg timeout ({FFMPEG_TIMEOUT}s)")
+        logger.warning(f"  yt-dlp timeout ({FFMPEG_TIMEOUT}s)")
         try:
             os.unlink(out_path)
-        except:
-            pass
-        try:
-            os.unlink(headers_file.name)
         except:
             pass
         return None
     except Exception as e:
-        logger.error(f"  ffmpeg error: {e}")
+        logger.error(f"  yt-dlp error: {e}")
         try:
             os.unlink(out_path)
-        except:
-            pass
-        try:
-            os.unlink(headers_file.name)
         except:
             pass
         return None
