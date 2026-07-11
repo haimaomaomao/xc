@@ -438,21 +438,11 @@ def download_m3u8_to_mp4(m3u8_url, referer):
             logger.warning(f"  Too many segments failed: {len(seg_files)}/{len(segments)}")
             return None
 
-        # Step 4: Write concat file and merge with ffmpeg
-        concat_file = os.path.join(tmp_dir, "concat.txt")
-        with open(concat_file, 'w') as f:
+        # Step 4: Binary concatenate all TS segments (no ffmpeg needed)
+        with open(out_path, "wb") as outf:
             for _, fname in seg_files:
-                f.write(f"file '{fname}'\n")
-
-        result = subprocess.run([
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-            "-i", concat_file, "-c", "copy", "-movflags", "+faststart",
-            out_path
-        ], capture_output=True, timeout=120, stdin=subprocess.DEVNULL)
-
-        if result.returncode != 0:
-            tail = result.stderr.decode(errors='replace')[-200:] if result.stderr else 'no stderr'
-            logger.warning(f"  ffmpeg merge failed: {tail}")
+                with open(fname, "rb") as inf:
+                    outf.write(inf.read())
             return None
 
         size_mb = os.path.getsize(out_path) / 1024 / 1024
