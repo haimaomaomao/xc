@@ -397,12 +397,12 @@ def download_m3u8_to_mp4(m3u8_url, referer):
         playlist = r.text
 
         # Step 2: Parse and filter .ts segment URLs
-        base_url = m3u8_url.rsplit('/', 1)[0] + '/'
+        from urllib.parse import urljoin
         segments = []
         for line in playlist.splitlines():
             line = line.strip()
             if line and not line.startswith('#'):
-                seg_url = line if line.startswith('http') else base_url + line
+                seg_url = urljoin(m3u8_url, line)
                 segments.append(seg_url)
 
         if not segments:
