@@ -368,88 +368,44 @@ def download_and_convert_thumbnail(url, referer, max_size_kb=200, max_dim=640):
 
 
 def download_m3u8_to_mp4(m3u8_url, referer):
-    """Download m3u8 video using Python requests for ts segments (keeps cookies) + ffmpeg for merging."""
-    import concurrent.futures
+    """Download m3u8 + remux to MP4 in one step via ffmpeg, passing cookies for auth."""
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     tmp.close()
     out_path = tmp.name
-    tmp_dir = None
-    tmp_dir = tempfile.mkdtemp(prefix="m3u8_")
     try:
-        logger.info(f"  Downloading m3u8 segments (requests+ffmpeg)...")
+        logger.info(f"  ffmpeg downloading + remuxing... (max {FFMPEG_TIMEOUT}s)")
         sys.stdout.flush()
-        # Step 1: Fetch m3u8 playlist
-        r = SESSION.get(m3u8_url, headers={"Referer": referer}, timeout=30)
-        r.raise_for_status()
-        playlist = r.text
-        # Step 2: Parse and filter .ts segment URLs
-        from urllib.parse import urljoin
-        segments = []
-        for line in playlist.splitlines():
-            line = line.strip()
-            if line and not line.startswith('#'):
-                seg_url = urljoin(m3u8_url, line)
-                segments.append(seg_url)
-        if not segments:
-            logger.warning("  No .ts segments found in m3u8")
-            return None
-        logger.info(f"  Found {len(segments)} segments, downloading in parallel...")
-        # Step 3: Download segments in parallel (8 threads)
-        seg_files = []
-        def download_seg(idx_url):
-            idx, url = idx_url
-            fname = os.path.join(tmp_dir, f"seg_{idx:05d}.ts")
-            try:
-                sr = SESSION.get(url, headers={"Referer": referer}, timeout=60)
-                sr.raise_for_status()
-                if len(sr.content) < 100:
-                    raise Exception(f"Segment too small: {len(sr.content)} bytes")
-                with open(fname, 'wb') as f:
-                    f.write(sr.content)
-                return (idx, fname)
-            except Exception as e:
-                logger.warning(f"  Segment {idx} failed: {e}")
-                return None
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-            results = list(executor.map(download_seg, enumerate(segments)))
-        seg_files = [r for r in results if r is not None]
-        seg_files.sort(key=lambda x: x[0])
-        if len(seg_files) < len(segments) * 0.8:
-            logger.warning(f"  Too many segments failed: {len(seg_files)}/{len(segments)}")
-            return None
-        # Step 4: Binary concatenate TS segments to temp file
-        ts_path = os.path.join(tmp_dir, "concat.ts")
-        with open(ts_path, "wb") as outf:
-            for _, fname in seg_files:
-                with open(fname, "rb") as inf:
-                    outf.write(inf.read())
-        ts_size = os.path.getsize(ts_path) / 1024 / 1024
-        logger.info(f"  TS downloaded: {ts_size:.1f}MB ({len(seg_files)} segments)")
-        # Step 5: Remux TS to proper MP4 (so Telegram can stream inline)
+        # Build cookie header from existing session cookies
+        cookie_str = "; ".join(
+            f"{c.name}={c.value}"
+            for c in SESSION.cookies
+            if c.domain in ("xchina.co", ".xchina.co", "video.xchina.download", ".video.xchina.download")
+        )
         cmd = [
-            "ffmpeg", "-y", "-i", ts_path,
+            "ffmpeg", "-y",
+            "-headers", f"Referer: {referer}\r\nCookie: {cookie_str}",
+            "-i", m3u8_url,
             "-c", "copy", "-movflags", "+faststart",
             "-f", "mp4", out_path
         ]
-        try:
-            subprocess.run(cmd, check=True, capture_output=True, timeout=FFMPEG_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            logger.warning(f"  ffmpeg remux timeout ({FFMPEG_TIMEOUT}s)")
-            return None
-        except subprocess.CalledProcessError as e:
-            logger.warning(f"  ffmpeg remux failed: {e.stderr.decode()[:200] if e.stderr else 'unknown'}")
-            return None
+        result = subprocess.run(cmd, capture_output=True, timeout=FFMPEG_TIMEOUT)
+        if result.returncode != 0:
+            err = result.stderr.decode() if result.stderr else "unknown"
+            logger.warning(f"  ffmpeg failed (rc={result.returncode}): {err[-400:]}")
+            # If ffmpeg fails, try binary concat fallback
+            logger.info("  Trying fallback: requests + ffmpeg remux...")
+            return _download_m3u8_fallback(m3u8_url, referer, out_path)
         size_mb = os.path.getsize(out_path) / 1024 / 1024
         logger.info(f"  MP4 ready: {size_mb:.1f}MB")
-        # Step 6: Extract duration via ffprobe
+        # Extract duration via ffprobe
         duration = None
         try:
-            result = subprocess.run(
+            probe = subprocess.run(
                 ["ffprobe", "-v", "error", "-show_entries", "format=duration",
                  "-of", "csv=p=0", out_path],
                 capture_output=True, text=True, timeout=30
             )
-            secs = float(result.stdout.strip())
+            secs = float(probe.stdout.strip())
             if secs >= 3600:
                 duration = f"{int(secs//3600)}:{int(secs%3600//60):02d}:{int(secs%60):02d}"
             else:
@@ -457,21 +413,93 @@ def download_m3u8_to_mp4(m3u8_url, referer):
         except:
             pass
         return out_path, duration
+    except subprocess.TimeoutExpired:
+        logger.warning(f"  ffmpeg timeout ({FFMPEG_TIMEOUT}s)")
+        return None
     except Exception as e:
         logger.error(f"  Download error: {e}")
         return None
-    finally:
-        # Cleanup temp dir
-        for f in os.listdir(tmp_dir):
+
+
+def _download_m3u8_fallback(m3u8_url, referer, out_path):
+    """Fallback: download TS segments via Python requests, concat, then remux."""
+    import concurrent.futures
+    from urllib.parse import urljoin
+    tmp_dir = None
+    try:
+        tmp_dir = tempfile.mkdtemp(prefix="m3u8_")
+        logger.info("  Fetching m3u8 playlist...")
+        r = SESSION.get(m3u8_url, headers={"Referer": referer}, timeout=30)
+        r.raise_for_status()
+        playlist = r.text
+        segments = []
+        for line in playlist.splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                segments.append(urljoin(m3u8_url, line))
+        if not segments:
+            logger.warning("  No segments in m3u8")
+            return None
+        logger.info(f"  Found {len(segments)} segments, downloading in parallel...")
+
+        def download_seg(idx_url):
+            idx, url = idx_url
+            fname = os.path.join(tmp_dir, f"seg_{idx:05d}.ts")
             try:
-                os.unlink(os.path.join(tmp_dir, f))
+                sr = SESSION.get(url, headers={"Referer": referer}, timeout=60)
+                sr.raise_for_status()
+                if len(sr.content) < 100:
+                    raise Exception(f"too small: {len(sr.content)}")
+                with open(fname, "wb") as f:
+                    f.write(sr.content)
+                return (idx, fname)
+            except Exception as e:
+                logger.warning(f"  Segment {idx} failed: {e}")
+                return None
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(executor.map(download_seg, enumerate(segments)))
+        seg_files = [r for r in results if r is not None]
+        seg_files.sort(key=lambda x: x[0])
+        if len(seg_files) < len(segments) * 0.8:
+            logger.warning(f"  Too many segments failed: {len(seg_files)}/{len(segments)}")
+            return None
+
+        ts_path = os.path.join(tmp_dir, "concat.ts")
+        with open(ts_path, "wb") as outf:
+            for _, fname in seg_files:
+                with open(fname, "rb") as inf:
+                    outf.write(inf.read())
+        ts_size = os.path.getsize(ts_path) / 1024 / 1024
+        logger.info(f"  TS concat: {ts_size:.1f}MB, remuxing...")
+
+        cmd = ["ffmpeg", "-y", "-i", ts_path, "-c", "copy", "-movflags", "+faststart", "-f", "mp4", out_path]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, timeout=FFMPEG_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            logger.warning(f"  ffmpeg remux timeout ({FFMPEG_TIMEOUT}s)")
+            return None
+        except subprocess.CalledProcessError as e:
+            err_text = e.stderr.decode() if e.stderr else "unknown"
+            logger.warning(f"  ffmpeg remux failed: {err_text[-400:]}")
+            return None
+        size_mb = os.path.getsize(out_path) / 1024 / 1024
+        logger.info(f"  MP4 ready: {size_mb:.1f}MB")
+        return out_path, None
+    except Exception as e:
+        logger.error(f"  Fallback error: {e}")
+        return None
+    finally:
+        if tmp_dir:
+            for f in os.listdir(tmp_dir):
+                try:
+                    os.unlink(os.path.join(tmp_dir, f))
+                except:
+                    pass
+            try:
+                os.rmdir(tmp_dir)
             except:
                 pass
-        try:
-            os.rmdir(tmp_dir)
-        except:
-            pass
-
 
 # ==================== Telegram sending ====================
 
