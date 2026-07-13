@@ -444,14 +444,14 @@ def download_m3u8_to_mp4(m3u8_url, referer):
 # ==================== Telegram sending ====================
 
 def build_caption(info):
-    title = info.get("title", "Unknown")
-    platform = info.get("platform", "")
-    actor = info.get("actor", "")
-    lines = [f"Title: {title}"]
+    title = info.get("标题", "Unknown")
+    platform = info.get("平台", "")
+    actor = info.get("演员", "")
+    lines = [f"标题：{title}"]
     if platform:
-        lines.append(f"Platform: #{platform}")
+        lines.append(f"平台：#{platform}")
     if actor:
-        lines.append(f"Actor: #{actor}")
+        lines.append(f"演员：#{actor}")
     return "\n".join(lines)
 
 async def send_video_with_thumb(client, video_path, thumb_path, caption):
