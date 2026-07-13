@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 xchina.co video downloader -> Telegram channel
 Railway deployment: self-looping, fetches one page every 6 hours
@@ -276,9 +276,9 @@ def get_videos_from_list(page):
             "vid_id": vid_id,
             "url": detail_url,
             "cover": cover,
-            "演员": actor,
-            "平台": platform,
-            "标题": title_from_list,
+            "婕斿憳": actor,
+            "骞冲彴": platform,
+            "鏍囬": title_from_list,
         })
     logger.info(f"  Found {len(videos)} videos")
     return videos
@@ -443,15 +443,15 @@ def download_m3u8_to_mp4(m3u8_url, referer):
 
 # ==================== Telegram sending ====================
 def build_caption(info):
-    """构建中文 caption，从 info 字典中读取中文 key。"""
-    title = info.get("标题", "Unknown")
-    platform = info.get("平台", "")
-    actor = info.get("演员", "")
-    lines = [f"标题: {title}"]
+    """鏋勫缓涓枃 caption锛屼粠 info 瀛楀吀涓鍙栦腑鏂?key銆?""
+    title = info.get("鏍囬", "Unknown")
+    platform = info.get("骞冲彴", "")
+    actor = info.get("婕斿憳", "")
+    lines = [f"鏍囬: {title}"]
     if platform:
-        lines.append(f"平台: #{platform}")
+        lines.append(f"骞冲彴: #{platform}")
     if actor:
-        lines.append(f"演员: #{actor}")
+        lines.append(f"婕斿憳: #{actor}")
     return "\n".join(lines)
 
 
