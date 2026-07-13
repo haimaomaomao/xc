@@ -414,8 +414,8 @@ def download_m3u8_to_mp4(m3u8_url, referer):
             pass
         return out_path, duration
     except subprocess.TimeoutExpired:
-        logger.warning(f"  ffmpeg timeout ({FFMPEG_TIMEOUT}s)")
-        return None
+        logger.warning(f"  ffmpeg timeout ({FFMPEG_TIMEOUT}s), trying fallback...")
+        return _download_m3u8_fallback(m3u8_url, referer, out_path)
     except Exception as e:
         logger.error(f"  Download error: {e}")
         return None
