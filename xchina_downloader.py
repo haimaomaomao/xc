@@ -276,9 +276,9 @@ def get_videos_from_list(page):
             "vid_id": vid_id,
             "url": detail_url,
             "cover": cover,
-            "婕斿憳": actor,
-            "骞冲彴": platform,
-            "鏍囬": title_from_list,
+            "演员": actor,
+            "平台": platform,
+            "标题": title_from_list,
         })
     logger.info(f"  Found {len(videos)} videos")
     return videos
@@ -308,19 +308,37 @@ def get_preview_image_url(video_url):
     if not r:
         return None
     soup = BeautifulSoup(r.text, "html.parser")
+    # 1) screenshot-container: try all imgs, pick the largest (usually best quality)
     container = soup.select_one("div.screenshot-container")
     if container:
         imgs = container.find_all("img")
         if imgs:
+            logger.debug(f"  Found {len(imgs)} screenshot(s) in container")
+            # Try each img, prefer ones with full-size URLs (not thumbnails)
+            for img in imgs:
+                src = img.get("src") or img.get("data-src") or ""
+                # Skip tiny thumbnail patterns
+                if src and "thumb" not in src.lower():
+                    return fix_url(src)
+            # Fallback: use first img even if it has 'thumb' in URL
             src = imgs[0].get("src") or imgs[0].get("data-src")
             if src:
                 return fix_url(src)
+    # 2) og:image meta
     og = soup.find("meta", property="og:image")
     if og and og.get("content"):
+        logger.debug("  Using og:image")
         return fix_url(og["content"])
+    # 3) twitter:image meta
     tw = soup.find("meta", attrs={"name": "twitter:image"})
     if tw and tw.get("content"):
+        logger.debug("  Using twitter:image")
         return fix_url(tw["content"])
+    # 4) video tag poster
+    video_tag = soup.find("video")
+    if video_tag and video_tag.get("poster"):
+        logger.debug("  Using video poster")
+        return fix_url(video_tag["poster"])
     return None
 
 
