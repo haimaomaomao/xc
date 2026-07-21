@@ -17,6 +17,8 @@ from bs4 import BeautifulSoup
 import os, re, time, json, sys, subprocess, tempfile, asyncio, base64, gzip, logging
 
 from telethon import TelegramClient
+from telethon.tl.types import InputMediaUploadedPhoto, InputMediaUploadedDocument, DocumentAttributeVideo
+from telethon.tl.functions.messages import SendMultiMediaRequest
 
 import urllib3
 
@@ -1182,6 +1184,44 @@ def build_caption(info, duration=None, tags=None):
     return "\n".join(lines)
 
 
+
+async def send_media_group(client, chat_id, photo_path, video_path, thumb_path, caption):
+    """Send photo + video as a media group (stacked layout: photo on top, video below, caption at bottom)."""
+    try:
+        logger.info("  Uploading media files...")
+        uploaded_photo = await client.upload_file(photo_path) if photo_path else None
+        uploaded_video = await client.upload_file(video_path)
+        uploaded_thumb = await client.upload_file(thumb_path) if thumb_path else None
+
+        media_items = []
+        if uploaded_photo:
+            media_items.append(InputMediaUploadedPhoto(file=uploaded_photo))
+
+        video_attrs = [DocumentAttributeVideo(
+            duration=0, w=0, h=0, supports_streaming=True
+        )]
+        video_kwargs = dict(
+            file=uploaded_video,
+            mime_type="video/mp4",
+            attributes=video_attrs,
+            force_file=False,
+        )
+        if uploaded_thumb:
+            video_kwargs["thumb"] = uploaded_thumb
+        media_items.append(InputMediaUploadedDocument(**video_kwargs))
+
+        logger.info(f"  Sending media group ({len(media_items)} items)...")
+        await client(SendMultiMediaRequest(
+            peer=chat_id,
+            multi_media=media_items,
+            message=caption or "",
+        ))
+        logger.info("  Media group sent successfully")
+        return True
+    except Exception as e:
+        logger.error(f"  Media group send error: {e}")
+        return False
+
 async def send_video_with_thumb(client, video_path, thumb_path, caption):
 
     try:
@@ -1383,37 +1423,13 @@ async def run_once():
             caption = build_caption(video, duration, tags)
             ok = True
 
-            # 1) Send cover photo
-            if photo_path:
-                try:
-                    logger.info("  Sending cover photo...")
-                    await client.send_file(CHAT_ID, photo_path)
-                    await asyncio.sleep(TG_INTERVAL)
-                except Exception as e:
-                    logger.warning(f"  Cover photo send failed: {e}")
-
-            # 2) Send video with thumbnail (no caption)
+            # Send as media group: photo (top) + video (bottom) + caption (below)
+            ok = True
             try:
-                logger.info("  Sending video...")
-                await client.send_file(
-                    CHAT_ID,
-                    video_path,
-                    thumb=thumb_path,
-                    supports_streaming=True,
-                    force_document=False
-                )
-                await asyncio.sleep(TG_INTERVAL)
+                ok = await send_media_group(client, CHAT_ID, photo_path, video_path, thumb_path, caption)
             except Exception as e:
-                logger.error(f"  Video send failed: {e}")
+                logger.error(f"  Send failed: {e}")
                 ok = False
-
-            # 3) Send caption text
-            if ok and caption:
-                try:
-                    logger.info("  Sending caption...")
-                    await client.send_message(CHAT_ID, caption)
-                except Exception as e:
-                    logger.warning(f"  Caption send failed: {e}")
 
             # Cleanup
             for p in [video_path, thumb_path, photo_path]:
