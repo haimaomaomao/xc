@@ -789,88 +789,6 @@ def download_and_convert_thumbnail(url, referer, max_size_kb=200, max_dim=640):
         return None
 
 
-def download_cover_photo(url, referer, max_dim=1920):
-
-    """Download cover image for sending as a standalone photo (larger than thumbnail)."""
-
-    try:
-
-        logger.info(f"  Downloading cover photo: {url[:80]}...")
-
-        r = SESSION.get(url, headers={"Referer": referer}, timeout=30)
-
-        r.raise_for_status()
-
-        if len(r.content) < 500:
-            logger.warning(f"  Cover photo too small ({len(r.content)} bytes)")
-
-            return None
-
-        img = Image.open(io.BytesIO(r.content))
-
-        if img.mode in ('RGBA', 'LA', 'PA'):
-
-            bg = Image.new('RGB', img.size, (255, 255, 255))
-
-            if img.mode == 'PA':
-
-                img = img.convert('RGBA')
-
-            bg.paste(img, mask=img.split()[-1])
-
-            img = bg
-
-        elif img.mode == 'P':
-
-            img = img.convert('RGBA')
-
-            bg = Image.new('RGB', img.size, (255, 255, 255))
-
-            bg.paste(img, mask=img.split()[-1])
-
-            img = bg
-
-        elif img.mode not in ('RGB',):
-
-            img = img.convert('RGB')
-
-        if max(img.size) > max_dim:
-
-            resample_filter = getattr(Image.Resampling, 'LANCZOS', Image.BICUBIC)
-
-            img.thumbnail((max_dim, max_dim), resample_filter)
-
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
-
-        img.save(tmp, format='JPEG', quality=92, optimize=True)
-
-        tmp.close()
-
-        size_kb = os.path.getsize(tmp.name) // 1024
-
-        logger.info(f"  Cover photo ready: {size_kb}KB, {img.size[0]}x{img.size[1]}")
-
-        return tmp.name
-
-    except Image.DecompressionBombError:
-
-        logger.error("  Cover photo too large (decompression bomb limit), skipped")
-
-        return None
-
-    except Image.UnidentifiedImageError:
-
-        logger.warning("  Cannot identify cover image format")
-
-        return None
-
-    except Exception as e:
-
-        logger.error(f"  Cover photo failed: {type(e).__name__}: {e}")
-
-        return None
-
-
 def download_m3u8_to_mp4(m3u8_url, referer):
 
     """Download m3u8 + remux to MP4 in one step via ffmpeg, passing cookies for auth."""
@@ -1407,43 +1325,20 @@ async def run_once():
             video_path, duration = result
 
             thumb_path = None
-            photo_path = None
             # img_url already obtained from get_detail_page_info above
             if not img_url and video.get("cover"):
                 img_url = video["cover"]
                 logger.info(f"  Using list page cover: {img_url}")
             if img_url:
-                photo_path = download_cover_photo(img_url, video["url"])
                 thumb_path = download_and_convert_thumbnail(img_url, video["url"])
             else:
-                logger.warning("  No preview image found, sending without cover")
+                logger.warning("  No preview image found, sending without thumbnail")
 
             tags = await generate_tags(video.get("标题", ""))
             caption = build_caption(video, duration, tags)
+            ok = await send_video_with_thumb(client, video_path, thumb_path, caption)
 
-            # Send as media group: cover photo + video (with thumb) + caption
-            ok = True
-            try:
-                files_to_send = []
-                if photo_path:
-                    files_to_send.append(photo_path)
-                files_to_send.append(video_path)
-                logger.info(f"  Sending media group ({len(files_to_send)} items)...")
-                await client.send_file(
-                    CHAT_ID,
-                    files_to_send,
-                    caption=caption,
-                    thumb=thumb_path,
-                    supports_streaming=True,
-                    force_document=False
-                )
-                await asyncio.sleep(TG_INTERVAL)
-            except Exception as e:
-                logger.error(f"  Send failed: {e}")
-                ok = False
-
-            # Cleanup
-            for p in [video_path, thumb_path, photo_path]:
+            for p in [video_path, thumb_path]:
                 if p and os.path.exists(p):
                     os.unlink(p)
             if ok:
