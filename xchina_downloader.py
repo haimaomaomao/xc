@@ -79,7 +79,7 @@ TG_INTERVAL     = int(os.getenv("TG_INTERVAL", "10"))
 
 LOOP_INTERVAL   = int(os.getenv("LOOP_INTERVAL", "21600"))
 
-FFMPEG_TIMEOUT  = int(os.getenv("FFMPEG_TIMEOUT", "300"))
+FFMPEG_TIMEOUT  = int(os.getenv("FFMPEG_TIMEOUT", "1800"))
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 
@@ -837,16 +837,13 @@ def download_cover_photo(url, referer, max_dim=1920):
         return None
 
 def download_m3u8_to_mp4(m3u8_url, referer):
-
-    """Download m3u8 + remux to MP4. Primary: 8-thread parallel TS download.
-    Fallback: ffmpeg single-thread direct download."""
-
+    """Download m3u8 + remux to MP4. Primary: ffmpeg direct download.
+    Fallback: 8-thread parallel TS download + remux."""
+    
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-
     tmp.close()
-
     out_path = tmp.name
-
+    
     # Helper: extract duration via ffprobe
     def _get_duration(path):
         try:
@@ -863,44 +860,48 @@ def download_m3u8_to_mp4(m3u8_url, referer):
         except Exception as e:
             logger.warning(f"  Duration extraction failed: {e}")
             return None
-
-    # Primary: 8-thread parallel download (faster than ffmpeg single-thread)
-    logger.info("  Trying 8-thread parallel download...")
+    
+    # Primary: ffmpeg direct download (more reliable)
+    logger.info(f"  Trying ffmpeg direct download... (max {FFMPEG_TIMEOUT}s)")
+    sys.stdout.flush()
+    cookie_str = "; ".join(
+        f"{c.name}={c.value}"
+        for c in SESSION.cookies
+        if c.domain in ("xchina.co", ".xchina.co", "video.xchina.download", ".video.xchina.download")
+    )
+    cmd = [
+        "ffmpeg", "-y",
+        "-headers", f"Referer: {referer}\r\nCookie: {cookie_str}",
+        "-i", m3u8_url,
+        "-c", "copy", "-movflags", "+faststart",
+        "-f", "mp4", out_path
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=FFMPEG_TIMEOUT)
+        if result.returncode == 0:
+            size_mb = os.path.getsize(out_path) / 1024 / 1024
+            logger.info(f"  MP4 ready: {size_mb:.1f}MB")
+            duration = _get_duration(out_path)
+            if duration:
+                return (out_path, duration)
+            return (out_path, None)
+        err = result.stderr.decode() if result.stderr else "unknown"
+        logger.warning(f"  ffmpeg failed (rc={result.returncode}): {err[-400:]}")
+    except subprocess.TimeoutExpired:
+        logger.warning(f"  ffmpeg timed out after {FFMPEG_TIMEOUT}s")
+    except Exception as e:
+        logger.warning(f"  ffmpeg error: {e}")
+    
+    # Fallback: 8-thread parallel TS download
+    logger.info("  Fallback: 8-thread parallel download...")
     fallback_result = _download_m3u8_fallback(m3u8_url, referer, out_path)
     if fallback_result:
         video_path, _ = fallback_result
         duration = _get_duration(video_path)
         logger.info(f"  MP4 ready: {os.path.getsize(video_path)/1024/1024:.1f}MB")
         return (video_path, duration)
-
-    # Fallback: ffmpeg direct download
-    logger.info(f"  Fallback: ffmpeg downloading... (max {FFMPEG_TIMEOUT}s)")
-    try:
-        sys.stdout.flush()
-        cookie_str = "; ".join(
-            f"{c.name}={c.value}"
-            for c in SESSION.cookies
-            if c.domain in ("xchina.co", ".xchina.co", "video.xchina.download", ".video.xchina.download")
-        )
-        cmd = [
-            "ffmpeg", "-y",
-            "-headers", f"Referer: {referer}\r\nCookie: {cookie_str}",
-            "-i", m3u8_url,
-            "-c", "copy", "-movflags", "+faststart",
-            "-f", "mp4", out_path
-        ]
-        result = subprocess.run(cmd, capture_output=True, timeout=FFMPEG_TIMEOUT)
-        if result.returncode != 0:
-            err = result.stderr.decode() if result.stderr else "unknown"
-            logger.warning(f"  ffmpeg failed (rc={result.returncode}): {err[-400:]}")
-            return None
-        size_mb = os.path.getsize(out_path) / 1024 / 1024
-        logger.info(f"  MP4 ready: {size_mb:.1f}MB")
-        duration = _get_duration(out_path)
-        return (out_path, duration)
-    except Exception as e:
-        logger.warning(f"  ffmpeg error: {e}")
-        return None
+    
+    return None
 
 def _download_m3u8_fallback(m3u8_url, referer, out_path):
 
@@ -1181,10 +1182,11 @@ async def send_media_group(client, chat_id, photo_path, video_path, thumb_path, 
         media_items.append(InputMediaUploadedDocument(**video_kwargs))
 
         logger.info(f"  Sending media group ({len(media_items)} items)...")
+        if media_items:
+            media_items[-1].caption = caption or ""
         await client(SendMultiMediaRequest(
             peer=chat_id,
             multi_media=media_items,
-            message=caption or "",
         ))
         logger.info("  Media group sent successfully")
         return True
@@ -1431,7 +1433,7 @@ async def run_once():
             if not ok and thumb_path:
                 logger.warning("  Media group failed, falling back to video+thumb...")
                 try:
-                    ok = await send_video_with_thumb(client, CHAT_ID, video_path, thumb_path, caption)
+                    ok = await send_video_with_thumb(client, video_path, thumb_path, caption)
                 except Exception as e2:
                     logger.error(f"  Fallback send failed: {e2}")
                     ok = False
